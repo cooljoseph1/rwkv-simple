@@ -1,0 +1,14 @@
+{
+  "activation_function": "relu",
+  "architectures": [
+    "RwkvNeoForCausalLM"
+  ],
+  "model_type": "rwkv",
+  "n_layer": 24,
+  "n_embd": 1024,
+  "ctx_len": 1024,
+  "tokenizer_class": "RwkvTokenizer",
+  "transformers_version": "0.0.0.dev",
+  "use_cache": true,
+  "vocab_size": 50254
+}
