@@ -21,6 +21,10 @@ class RWKV_RNN(nn.Module):
 
         self.eval() # set torch to inference mode
         
+        """
+        From here to the end of the function is really messy code to convert how the model
+        weights were saved into an actual usable model.
+        """
         w = torch.load(self.model_path, map_location='cpu')
         for k in w.keys():
             if      '.time_' in k: w[k] = w[k].squeeze()
@@ -87,7 +91,10 @@ class Block(nn.Module):
     def __init__(self, n_embed, attention, feed_forward_network, layer_norm1, layer_norm2):
         super().__init__()
         self.n_embed = n_embed
-        self.attention = attention
+        self.attention = AttentionLayer(
+            attention.key.weight, attention.value.weight, attention.receptance.weight, attention.output.weight,
+            attention.time_mix_k, attention.time_mix_v, attention.time_mix_r, attention.time_first, attention.time_decay, 
+        )
         self.feed_forward_network = FeedForwardNetwork(
             feed_forward_network.key.weight,
             feed_forward_network.value.weight,
@@ -99,10 +106,10 @@ class Block(nn.Module):
         self.layer_norm2 = layer_norm2
 
     def forward(self, x, state):
-        att = self.attention
-        x = x + self.time_mixing(self.layer_norm(x, self.layer_norm1), state,
-            att.time_mix_k, att.time_mix_v, att.time_mix_r, att.time_first, att.time_decay, 
-            att.key.weight, att.value.weight, att.receptance.weight, att.output.weight)
+        x += self.attention.time_mixing(
+            self.layer_norm(x, self.layer_norm1),
+            state
+        )
         x += self.feed_forward_network.channel_mixing(
             self.layer_norm(x, self.layer_norm2),
             state,
@@ -112,34 +119,6 @@ class Block(nn.Module):
     
     def layer_norm(self, x, w):
         return F.layer_norm(x, (self.n_embed,), weight=w.weight, bias=w.bias)
-
-    def time_mixing(self, x, state, time_mix_k, time_mix_v, time_mix_r, time_first, time_decay, kw, vw, rw, ow):
-        xk = x * time_mix_k + state[1] * (1 - time_mix_k)
-        xv = x * time_mix_v + state[1] * (1 - time_mix_v)
-        xr = x * time_mix_r + state[1] * (1 - time_mix_r)
-        state[1] = x
-        r = torch.sigmoid(rw @ xr)
-        k = kw @ xk
-        v = vw @ xv
-        
-        aa = state[2]
-        bb = state[3]
-        pp = state[4]
-        ww = time_first + k
-        qq = torch.maximum(pp, ww)
-        e1 = torch.exp(pp - qq)
-        e2 = torch.exp(ww - qq)
-        a = e1 * aa + e2 * v
-        b = e1 * bb + e2
-        wkv = a / b
-        ww = pp + time_decay
-        qq = torch.maximum(ww, k)
-        e1 = torch.exp(ww - qq)
-        e2 = torch.exp(k - qq)
-        state[2] = e1 * aa + e2 * v
-        state[3] = e1 * bb + e2
-        state[4] = qq
-        return ow @ (r * wkv)
 
 
 ########################################################################################################
@@ -167,3 +146,46 @@ class FeedForwardNetwork(nn.Module):
 
 ########################################################################################################
 
+class AttentionLayer(nn.Module):
+    def __init__(self, key, value, receptance, output_weight,
+            time_mix_k, time_mix_v, time_mix_r, time_first, time_decay):
+        super().__init__()
+
+        self.key = key
+        self.value = value
+        self.receptance = receptance
+        self.output_weight = output_weight
+        self.time_mix_k = time_mix_k
+        self.time_mix_v = time_mix_v
+        self.time_mix_r = time_mix_r
+        self.time_first = time_first
+        self.time_decay = time_decay
+
+
+    def time_mixing(self, x, state):
+        xk = x * self.time_mix_k + state[1] * (1 - self.time_mix_k)
+        xv = x * self.time_mix_v + state[1] * (1 - self.time_mix_v)
+        xr = x * self.time_mix_r + state[1] * (1 - self.time_mix_r)
+        state[1] = x
+        r = torch.sigmoid(self.receptance @ xr)
+        k = self.key @ xk
+        v = self.value @ xv
+        
+        aa = state[2]
+        bb = state[3]
+        pp = state[4]
+        ww = self.time_first + k
+        qq = torch.maximum(pp, ww)
+        e1 = torch.exp(pp - qq)
+        e2 = torch.exp(ww - qq)
+        a = e1 * aa + e2 * v
+        b = e1 * bb + e2
+        wkv = a / b
+        ww = pp + self.time_decay
+        qq = torch.maximum(ww, k)
+        e1 = torch.exp(ww - qq)
+        e2 = torch.exp(k - qq)
+        state[2] = e1 * aa + e2 * v
+        state[3] = e1 * bb + e2
+        state[4] = qq
+        return self.output_weight @ (r * wkv)
