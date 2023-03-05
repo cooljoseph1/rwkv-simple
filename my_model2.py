@@ -88,8 +88,13 @@ class Block(nn.Module):
         super().__init__()
         self.n_embed = n_embed
         self.attention = attention
-        self.feed_forward_network = feed_forward_network
-        print(dir(self.feed_forward_network))
+        self.feed_forward_network = FeedForwardNetwork(
+            feed_forward_network.key.weight,
+            feed_forward_network.value.weight,
+            feed_forward_network.receptance.weight,
+            feed_forward_network.time_mix_k,
+            feed_forward_network.time_mix_r,
+        )
         self.layer_norm1 = layer_norm1
         self.layer_norm2 = layer_norm2
 
@@ -98,10 +103,10 @@ class Block(nn.Module):
         x = x + self.time_mixing(self.layer_norm(x, self.layer_norm1), state,
             att.time_mix_k, att.time_mix_v, att.time_mix_r, att.time_first, att.time_decay, 
             att.key.weight, att.value.weight, att.receptance.weight, att.output.weight)
-        ffn = self.feed_forward_network
-        x = x + self.channel_mixing(self.layer_norm(x, self.layer_norm2), state,
-            ffn.time_mix_k, ffn.time_mix_r, 
-            ffn.key.weight, ffn.value.weight, ffn.receptance.weight)
+        x += self.feed_forward_network.channel_mixing(
+            self.layer_norm(x, self.layer_norm2),
+            state,
+        )
         return x, state
         
     
@@ -135,18 +140,30 @@ class Block(nn.Module):
         state[3] = e1 * bb + e2
         state[4] = qq
         return ow @ (r * wkv)
-    
-    def channel_mixing(self, x, state, time_mix_k, time_mix_r, kw, vw, rw):
-        xk = x * time_mix_k + state[0] * (1 - time_mix_k)
-        xr = x * time_mix_r + state[0] * (1 - time_mix_r)
-        state[0] = x
-        r = torch.sigmoid(rw @ xr)
-        k = torch.square(torch.relu(kw @ xk)) # square relu, primer paper
-        return r * (vw @ k)
 
 
 ########################################################################################################
 
 class FeedForwardNetwork(nn.Module):
-    def __init__(self):
+    def __init__(self, key, value, receptance, time_mix_k, time_mix_r):
         super().__init__()
+
+        self.key = key
+        self.value = value
+        self.receptance = receptance
+        self.time_mix_k = time_mix_k
+        self.time_mix_r = time_mix_r
+
+    
+    def channel_mixing(self, x, state):
+        xk = x * self.time_mix_k + state[0] * (1 - self.time_mix_k)
+        xr = x * self.time_mix_r + state[0] * (1 - self.time_mix_r)
+        state[0] = x
+        r = torch.sigmoid(self.receptance @ xr)
+        k = torch.square(torch.relu(self.key @ xk)) # square relu, primer paper
+        return r * (self.value @ k)
+    
+
+
+########################################################################################################
+
