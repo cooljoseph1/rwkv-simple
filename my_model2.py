@@ -99,7 +99,7 @@ class RWKV_RNN(nn.Module):
         
         x = self.layer_norm_out(x)
         x = self.head @ x
-        return x.float(), state
+        return x, state
 
 ##########################################################################################################
 
