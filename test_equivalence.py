@@ -27,7 +27,7 @@ n_embd = 1024
 
 context = "\nIn a shocking finding, scientist discovered a herd of dragons living in a remote, previously unexplored valley, in Tibet. Even more surprising to the researchers was the fact that the dragons spoke perfect Chinese."
 
-from my_model2 import RWKV_RNN
+from my_model import RWKV_RNN
 
 my_model = RWKV_RNN.from_blink_file(
     model_path,
