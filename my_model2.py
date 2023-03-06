@@ -6,64 +6,76 @@ import numpy as np
 np.set_printoptions(precision=4, suppress=True, linewidth=200)
 import types, torch
 from torch.nn import functional as F
-from tokenizers import Tokenizer
 
 import torch.nn as nn
 
 ########################################################################################################
 
 class RWKV_RNN(nn.Module):
-    def __init__(self, model_path, n_layer=24, n_embed=1024):
+    def __init__(self, embeddings, layer_norm0, blocks, head, layer_norm_out, n_layer=24, n_embed=1024):
         super().__init__()
-        self.model_path = model_path
         self.n_layer = n_layer
         self.n_embed = n_embed
 
+        self.embeddings = embeddings
+        self.layer_norm0 = layer_norm0
+        self.blocks = nn.ModuleList(blocks)
+        self.head = head
+        self.layer_norm_out = layer_norm_out
+
         self.eval() # set torch to inference mode
-        
-        """
-        From here to the end of the function is really messy code to convert how the model
-        weights were saved into an actual usable model.
-        """
-        w = torch.load(self.model_path, map_location='cpu')
+
+    @classmethod
+    def from_blink_file(cls, path_to_file):
+        w = torch.load(path_to_file, map_location='cpu')
         for k in w.keys():
             if      '.time_' in k: w[k] = w[k].squeeze()
             if '.time_decay' in k: w[k] = -torch.exp(w[k].float()) # the real time decay is like e^{-e^x}
             else: w[k] = w[k].float() # convert to f32 type
+
         
-        
-        self.w = types.SimpleNamespace() # set self.w from w
-        self.w.blocks = {}
+        namespace = types.SimpleNamespace()
+        namespace.blocks = {}
+        n_layer = 0
         for k in w.keys(): # example: "blocks.0.att.time_first" => self.w.blocks[0].att.time_first
             parts = k.split('.')
             last = parts.pop()
-            here = self.w
+            here = namespace
             for p in parts:
                 if p.isdigit():
                     p = int(p)
+                    n_layer = max(n_layer, p + 1)
                     if p not in here: here[p] = types.SimpleNamespace()
                     here = here[p]
                 else:
                     if not hasattr(here, p): setattr(here, p, types.SimpleNamespace())
                     here = getattr(here, p)
             setattr(here, last, w[k])
-
+        
+        n_embed = len(namespace.blocks[0].ffn.time_mix_k.squeeze())
         blocks = []
-        for i in range(self.n_layer):
-            b = self.w.blocks[i]
-            attention = b.att
-            feed_forward_network = b.ffn
+        for i in range(n_layer):
+            b = namespace.blocks[i]
+            attention = AttentionLayer.from_namespace(b.att)
+            feed_forward_network = FeedForwardNetwork.from_namespace(b.ffn)
             layer_norm1 = b.ln1
             layer_norm2 = b.ln2
             block = Block(
-                self.n_embed,
+                n_embed,
                 attention,
                 feed_forward_network,
                 layer_norm1,
                 layer_norm2,
             )
             blocks.append(block)
-        self.blocks = nn.ModuleList(blocks)
+
+        embeddings = namespace.emb.weight
+        layer_norm0 = namespace.blocks[0].ln0
+
+        head = namespace.head.weight
+        layer_norm_out = namespace.ln_out
+        return cls(embeddings, layer_norm0, blocks, head, layer_norm_out, n_layer, n_embed)
+        
 
     def layer_norm(self, x, w):
         return F.layer_norm(x, (self.n_embed,), weight=w.weight, bias=w.bias)
@@ -74,15 +86,12 @@ class RWKV_RNN(nn.Module):
                 state = torch.zeros(self.n_layer * 5, self.n_embed)
                 for i in range(self.n_layer): state[5*i+4] = -1e30 # -infinity
             
-            x = self.w.emb.weight[token]
-            x = self.layer_norm(x, self.w.blocks[0].ln0)
+            x = self.embeddings[token]
+            x = self.layer_norm(x, self.layer_norm0)
             for i, block in enumerate(self.blocks):
                 x, state[5*i : 5*(i + 1)] = block.forward(x, state[5*i : 5*(i + 1)])
-
-
-                
             
-            x = self.w.head.weight @ self.layer_norm(x, self.w.ln_out)
+            x = self.head @ self.layer_norm(x, self.layer_norm_out)
             return x.float(), state
 
 ##########################################################################################################
@@ -91,17 +100,8 @@ class Block(nn.Module):
     def __init__(self, n_embed, attention, feed_forward_network, layer_norm1, layer_norm2):
         super().__init__()
         self.n_embed = n_embed
-        self.attention = AttentionLayer(
-            attention.key.weight, attention.value.weight, attention.receptance.weight, attention.output.weight,
-            attention.time_mix_k, attention.time_mix_v, attention.time_mix_r, attention.time_first, attention.time_decay, 
-        )
-        self.feed_forward_network = FeedForwardNetwork(
-            feed_forward_network.key.weight,
-            feed_forward_network.value.weight,
-            feed_forward_network.receptance.weight,
-            feed_forward_network.time_mix_k,
-            feed_forward_network.time_mix_r,
-        )
+        self.attention = attention
+        self.feed_forward_network = feed_forward_network
         self.layer_norm1 = layer_norm1
         self.layer_norm2 = layer_norm2
 
@@ -133,6 +133,24 @@ class FeedForwardNetwork(nn.Module):
         self.time_mix_k = time_mix_k
         self.time_mix_r = time_mix_r
 
+    @classmethod
+    def from_namespace(cls, namespace):
+        """
+        Return a feed forward network layer given a namespace `ffn` that defines
+        - ffn.key.weight,
+        - ffn.value.weight,
+        - ffn.receptance.weight,
+        - ffn.time_mix_k,
+        - ffn.time_mix_r,
+        """
+        return cls(
+            namespace.key.weight,
+            namespace.value.weight,
+            namespace.receptance.weight,
+            namespace.time_mix_k,
+            namespace.time_mix_r,
+        )
+
     
     def channel_mixing(self, x, state):
         xk = x * self.time_mix_k + state[0] * (1 - self.time_mix_k)
@@ -160,6 +178,25 @@ class AttentionLayer(nn.Module):
         self.time_mix_r = time_mix_r
         self.time_first = time_first
         self.time_decay = time_decay
+
+    @classmethod
+    def from_namespace(cls, namespace):
+        """
+        Return an attention layer given a namespace `attention` that defines
+        - attention.key.weight
+        - attention.value.weight
+        - attention.receptance.weight
+        - attention.output.weight
+        - attention.time_mix_k
+        - attention.time_mix_v
+        - attention.time_mix_r
+        - attention.time_first
+        - attention.time_decay
+        """
+        return cls(
+            namespace.key.weight, namespace.value.weight, namespace.receptance.weight, namespace.output.weight,
+            namespace.time_mix_k, namespace.time_mix_v, namespace.time_mix_r, namespace.time_first, namespace.time_decay, 
+        )
 
 
     def time_mixing(self, x, state):

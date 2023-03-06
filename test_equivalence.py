@@ -29,10 +29,8 @@ context = "\nIn a shocking finding, scientist discovered a herd of dragons livin
 
 from my_model2 import RWKV_RNN
 
-my_model = RWKV_RNN(
+my_model = RWKV_RNN.from_blink_file(
     model_path,
-    n_layer,
-    n_embd,
 )
 # from load_model import RWKV
 # my_model = RWKV(
