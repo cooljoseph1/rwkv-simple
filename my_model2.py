@@ -88,14 +88,20 @@ class RWKV_RNN(nn.Module):
         return cls(n_layer, n_embed, embeddings, layer_norm0, blocks, layer_norm_out, head)
 
     def forward(self, token, state):
+        """
+        Do a forward pass of this neural network.
+        
+        token: The index of the next token to be processed. (type: int)
+        state: A torch tensor of shape (n_layer, 5, n_embed) representing the hidden state of the recurrent part
+        """
         if state == None:
-            state = torch.zeros(self.n_layer * 5, self.n_embed)
-            state[4::5] = -1e30 # -infinity
+            state = torch.zeros((self.n_layer, 5, self.n_embed))
+            state[:, 4, :] = -1e30 # -infinity
         
         x = self.embeddings[token]
         x = self.layer_norm0.forward(x)
         for i, block in enumerate(self.blocks):
-            x, state[5*i : 5*(i + 1)] = block.forward(x, state[5*i : 5*(i + 1)])
+            x, state[i] = block.forward(x, state[i])
         
         x = self.layer_norm_out(x)
         x = self.head @ x
