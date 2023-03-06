@@ -2,8 +2,6 @@
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
 
-import numpy as np
-np.set_printoptions(precision=4, suppress=True, linewidth=200)
 import types, torch
 from torch.nn import functional as F
 
@@ -23,17 +21,21 @@ class RWKV_RNN(nn.Module):
         self.head = head
         self.layer_norm_out = layer_norm_out
 
-        self.eval() # set torch to inference mode
-
     @classmethod
     def from_blink_file(cls, path_to_file):
+        """
+        Given a file with a pretrained model from BlinkDL, convert this into
+        a network.
+        """
+        ## Step 1: Load the weights from the file & modify them appropriately
         w = torch.load(path_to_file, map_location='cpu')
         for k in w.keys():
             if      '.time_' in k: w[k] = w[k].squeeze()
             if '.time_decay' in k: w[k] = -torch.exp(w[k].float()) # the real time decay is like e^{-e^x}
-            else: w[k] = w[k].float() # convert to f32 type
+            else: w[k] = w[k].float()
 
         
+        ## Step 2: Convert this into a namespace, putting the blocks in a dictionary
         namespace = types.SimpleNamespace()
         namespace.blocks = {}
         n_layer = 0
@@ -52,28 +54,37 @@ class RWKV_RNN(nn.Module):
                     here = getattr(here, p)
             setattr(here, last, w[k])
         
-        n_embed = len(namespace.blocks[0].ffn.time_mix_k.squeeze())
+        ## Step 3: Build the different components of the network
+        embeddings = namespace.emb.weight
+        n_embed = len(embeddings[0])
+
+
+        layer_norm0 = LayerNorm(
+            n_embed,
+            namespace.blocks[0].ln0.weight,
+            namespace.blocks[0].ln0.bias,
+        )
+
         blocks = []
         for i in range(n_layer):
             b = namespace.blocks[i]
             attention = AttentionLayer.from_namespace(b.att)
             feed_forward_network = FeedForwardNetwork.from_namespace(b.ffn)
-            layer_norm1 = b.ln1
-            layer_norm2 = b.ln2
+            layer_norm1 = LayerNorm(n_embed, b.ln1.weight, b.ln1.bias)
+            layer_norm2 = LayerNorm(n_embed, b.ln2.weight, b.ln2.bias)
             block = Block(
                 n_embed,
                 attention,
-                feed_forward_network,
                 layer_norm1,
+                feed_forward_network,
                 layer_norm2,
             )
             blocks.append(block)
 
-        embeddings = namespace.emb.weight
-        layer_norm0 = namespace.blocks[0].ln0
-
         head = namespace.head.weight
-        layer_norm_out = namespace.ln_out
+        layer_norm_out = LayerNorm(n_embed, namespace.ln_out.weight, namespace.ln_out.bias)
+
+        ## Finally, put all these components together in the main network
         return cls(embeddings, layer_norm0, blocks, head, layer_norm_out, n_layer, n_embed)
         
 
@@ -81,44 +92,77 @@ class RWKV_RNN(nn.Module):
         return F.layer_norm(x, (self.n_embed,), weight=w.weight, bias=w.bias)
 
     def forward(self, token, state):
-        with torch.no_grad():
-            if state == None:
-                state = torch.zeros(self.n_layer * 5, self.n_embed)
-                for i in range(self.n_layer): state[5*i+4] = -1e30 # -infinity
-            
-            x = self.embeddings[token]
-            x = self.layer_norm(x, self.layer_norm0)
-            for i, block in enumerate(self.blocks):
-                x, state[5*i : 5*(i + 1)] = block.forward(x, state[5*i : 5*(i + 1)])
-            
-            x = self.head @ self.layer_norm(x, self.layer_norm_out)
-            return x.float(), state
+        if state == None:
+            state = torch.zeros(self.n_layer * 5, self.n_embed)
+            state[4::5] = -1e30 # -infinity
+        
+        x = self.embeddings[token]
+        x = self.layer_norm0.forward(x)
+        for i, block in enumerate(self.blocks):
+            x, state[5*i : 5*(i + 1)] = block.forward(x, state[5*i : 5*(i + 1)])
+        
+        x = self.layer_norm_out(x)
+        x = self.head @ x
+        return x.float(), state
+
+##########################################################################################################
+
+class LayerNorm(nn.Module):
+    def __init__(self, n_embed, weight, bias):
+        super().__init__()
+
+        self.n_embed = n_embed
+        self.weight = weight
+        self.bias = bias
+
+    def forward(self, x):
+        return F.layer_norm(x, (self.n_embed,), weight=self.weight, bias=self.bias)
+
+##########################################################################################################
+
+class EmbeddingLayer(nn.Module):
+    """
+    This is an embedding layer for tokens followed by a layer norm
+    """
+    def __init__(self, embeddings, layer_norm_weight, layer_norm_bias):
+        super().__init__()
+
+        self.embeddings = embeddings
+        self.n_embed = len(self.embeddings[0])
+        self.layer_norm_weight = layer_norm_weight
+        self.layer_norm_bias = layer_norm_bias
+
+    def forward(self, token):
+        x = self.embeddings[token]
+        x = F.layer_norm(x, (self.n_embed,), weight=self.layer_norm_weight, bias=self.layer_norm_bias)
+        return x
 
 ##########################################################################################################
 
 class Block(nn.Module):
-    def __init__(self, n_embed, attention, feed_forward_network, layer_norm1, layer_norm2):
+    """
+    The main "transformer" blocks that make up the network. I put "transformer" in quotes because it's not
+    really a transformer (since it doesn't use the same kind of attention mechanism).
+    """
+    def __init__(self, n_embed, attention, layer_norm1, feed_forward_network, layer_norm2):
         super().__init__()
         self.n_embed = n_embed
         self.attention = attention
-        self.feed_forward_network = feed_forward_network
         self.layer_norm1 = layer_norm1
+        self.feed_forward_network = feed_forward_network
         self.layer_norm2 = layer_norm2
 
     def forward(self, x, state):
         x += self.attention.time_mixing(
-            self.layer_norm(x, self.layer_norm1),
+            self.layer_norm1.forward(x),
             state
         )
         x += self.feed_forward_network.channel_mixing(
-            self.layer_norm(x, self.layer_norm2),
+            self.layer_norm2.forward(x),
             state,
         )
         return x, state
         
-    
-    def layer_norm(self, x, w):
-        return F.layer_norm(x, (self.n_embed,), weight=w.weight, bias=w.bias)
 
 
 ########################################################################################################
