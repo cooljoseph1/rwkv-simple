@@ -10,16 +10,18 @@ import torch.nn as nn
 ########################################################################################################
 
 class RWKV_RNN(nn.Module):
-    def __init__(self, embeddings, layer_norm0, blocks, head, layer_norm_out, n_layer=24, n_embed=1024):
+    def __init__(self, n_layer, n_embed, embeddings, layer_norm0, blocks, layer_norm_out, head):
         super().__init__()
         self.n_layer = n_layer
         self.n_embed = n_embed
 
         self.embeddings = embeddings
         self.layer_norm0 = layer_norm0
+
         self.blocks = nn.ModuleList(blocks)
-        self.head = head
+
         self.layer_norm_out = layer_norm_out
+        self.head = head
 
     @classmethod
     def from_blink_file(cls, path_to_file):
@@ -34,8 +36,7 @@ class RWKV_RNN(nn.Module):
             if '.time_decay' in k: w[k] = -torch.exp(w[k].float()) # the real time decay is like e^{-e^x}
             else: w[k] = w[k].float()
 
-        
-        ## Step 2: Convert this into a namespace, putting the blocks in a dictionary
+        ## Step 2: Convert w into a namespace, putting the blocks in a dictionary
         namespace = types.SimpleNamespace()
         namespace.blocks = {}
         n_layer = 0
@@ -57,7 +58,6 @@ class RWKV_RNN(nn.Module):
         ## Step 3: Build the different components of the network
         embeddings = namespace.emb.weight
         n_embed = len(embeddings[0])
-
 
         layer_norm0 = LayerNorm(
             n_embed,
@@ -85,11 +85,7 @@ class RWKV_RNN(nn.Module):
         layer_norm_out = LayerNorm(n_embed, namespace.ln_out.weight, namespace.ln_out.bias)
 
         ## Finally, put all these components together in the main network
-        return cls(embeddings, layer_norm0, blocks, head, layer_norm_out, n_layer, n_embed)
-        
-
-    def layer_norm(self, x, w):
-        return F.layer_norm(x, (self.n_embed,), weight=w.weight, bias=w.bias)
+        return cls(n_layer, n_embed, embeddings, layer_norm0, blocks, layer_norm_out, head)
 
     def forward(self, token, state):
         if state == None:
