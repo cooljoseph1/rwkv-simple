@@ -120,25 +120,6 @@ class LayerNorm(nn.Module):
 
 ##########################################################################################################
 
-class EmbeddingLayer(nn.Module):
-    """
-    This is an embedding layer for tokens followed by a layer norm
-    """
-    def __init__(self, embeddings, layer_norm_weight, layer_norm_bias):
-        super().__init__()
-
-        self.embeddings = embeddings
-        self.n_embed = len(self.embeddings[0])
-        self.layer_norm_weight = layer_norm_weight
-        self.layer_norm_bias = layer_norm_bias
-
-    def forward(self, token):
-        x = self.embeddings[token]
-        x = F.layer_norm(x, (self.n_embed,), weight=self.layer_norm_weight, bias=self.layer_norm_bias)
-        return x
-
-##########################################################################################################
-
 class Block(nn.Module):
     """
     The main "transformer" blocks that make up the network. I put "transformer" in quotes because it's not
